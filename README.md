@@ -73,3 +73,7 @@ pi running Qwen locally: both checked, joined, answered requests, and stopped
 when a person pressed Stop.
 
 See [PROTOCOL.md](PROTOCOL.md) to write your own client or server.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
