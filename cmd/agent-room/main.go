@@ -8,8 +8,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/KakkoiDev/agent-room/room"
@@ -23,6 +25,9 @@ func main() {
 	public := flag.String("public-url", "", "address people and agents use, such as https://box.example.ts.net (default: what the browser uses)")
 	tailscale := flag.Bool("tailscale", false, "require the Tailscale-User-Login header set by Tailscale Serve")
 	login := flag.String("tailscale-login", "", "allow only this Tailscale login (implies -tailscale)")
+	var origins, hosts list
+	flag.Var(&origins, "allow-origin", "web app origin that may use the API from the browser, such as https://app.example or http://localhost:* (repeatable, or comma-separated)")
+	flag.Var(&hosts, "allow-host", "extra host name the server answers to, such as box.lan or *.example.com (repeatable, or comma-separated)")
 	flag.Parse()
 
 	store, err := room.NewFileStore(*dir)
@@ -31,7 +36,23 @@ func main() {
 	}
 	defer store.Close()
 
-	opts := room.Options{BasePath: *base, PublicURL: *public}
+	// Answer only to names that mean this server, so a web page cannot reach it
+	// by DNS rebinding.
+	hosts = append(hosts, "localhost", "127.0.0.1", "::1")
+	if host, _, _ := net.SplitHostPort(*addr); host != "" && !net.ParseIP(host).IsUnspecified() {
+		hosts = append(hosts, host)
+	}
+	if *public != "" {
+		u, err := url.Parse(*public)
+		if err != nil || u.Hostname() == "" {
+			log.Fatalf("-public-url must be an address such as https://box.example.ts.net")
+		}
+		hosts = append(hosts, u.Hostname())
+	}
+	if *tailscale || *login != "" {
+		hosts = append(hosts, "*.ts.net")
+	}
+	opts := room.Options{BasePath: *base, PublicURL: *public, AllowedOrigins: origins, AllowedHosts: hosts}
 	if *tailscale || *login != "" {
 		opts.Authorize = func(r *http.Request) error {
 			got := r.Header.Get("Tailscale-User-Login")
@@ -62,4 +83,18 @@ func isLoopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// list is a flag that may be repeated or given comma-separated values.
+type list []string
+
+func (l *list) String() string { return strings.Join(*l, ",") }
+
+func (l *list) Set(v string) error {
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			*l = append(*l, item)
+		}
+	}
+	return nil
 }
