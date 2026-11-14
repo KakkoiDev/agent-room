@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 //go:embed agent-room.py
@@ -41,6 +43,16 @@ type Options struct {
 	// PublicURL is the address people and agents use to reach the server, such as
 	// "https://box.example.ts.net". When empty, the chat page supplies its own.
 	PublicURL string
+	// AllowedOrigins are web app origins, such as "https://app.example", that
+	// may call the API from the browser (CORS). A trailing ":*" allows any port,
+	// as in "http://localhost:*". Clients send their token in the Authorization
+	// header; cookies are never used.
+	AllowedOrigins []string
+	// AllowedHosts, when not empty, are the only Host header names (port
+	// ignored) the server answers; others get 421. A leading "*." allows any
+	// subdomain, as in "*.ts.net". This stops DNS rebinding attacks on a server
+	// listening on localhost.
+	AllowedHosts []string
 }
 
 // Server holds the rooms' live state. Create it with New.
@@ -56,6 +68,23 @@ type Server struct {
 // New loads sessions from the store and returns a server.
 func New(store Store, opts Options) *Server {
 	opts.BasePath = strings.TrimRight(opts.BasePath, "/")
+	origins := []string{}
+	for _, o := range opts.AllowedOrigins {
+		o = strings.ToLower(strings.TrimRight(strings.TrimSpace(o), "/"))
+		if !validOrigin(o) {
+			log.Printf("agent-room: ignoring allowed origin %q: use scheme://host, scheme://host:port or scheme://host:*", o)
+			continue
+		}
+		origins = append(origins, o)
+	}
+	opts.AllowedOrigins = origins
+	hosts := []string{}
+	for _, h := range opts.AllowedHosts {
+		if h = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), ".")); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	opts.AllowedHosts = hosts
 	members, err := store.LoadMembers()
 	if err != nil {
 		log.Printf("agent-room: could not load sessions: %v", err)
@@ -99,19 +128,104 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/chat/rooms/{room}/participants", s.join)
 	mux.HandleFunc("POST /api/chat/rooms/{room}/participants/stop", s.stop)
 	mux.HandleFunc("POST /api/chat/rooms/{room}/assignments", s.action)
-	protected := http.NewCrossOriginProtection().Handler(mux)
+	protection := http.NewCrossOriginProtection()
+	for _, o := range s.opts.AllowedOrigins {
+		if !strings.HasSuffix(o, ":*") {
+			if err := protection.AddTrustedOrigin(o); err != nil {
+				log.Printf("agent-room: %v", err)
+			}
+		}
+	}
+	protected := protection.Handler(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		if !s.allowedHost(r.Host) {
+			http.Error(w, "This server does not answer to that host name. Start agent-room with -allow-host NAME to use it.", http.StatusMisdirectedRequest)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		allowed := origin != "" && s.allowedOrigin(origin)
+		if allowed {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Add("Vary", "Origin")
+			h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			h.Set("Access-Control-Allow-Methods", "GET, POST")
+			h.Set("Access-Control-Max-Age", "600")
+			if r.Method == http.MethodOptions {
+				// A preflight carries no credentials, so answer it before Authorize.
+				if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+					h.Set("Access-Control-Allow-Private-Network", "true")
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
 		if s.opts.Authorize != nil {
 			if err := s.opts.Authorize(r); err != nil {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
 		}
+		if allowed {
+			// Allowed origins (including port wildcards, which
+			// CrossOriginProtection cannot express) may post cross-origin.
+			mux.ServeHTTP(w, r)
+			return
+		}
 		protected.ServeHTTP(w, r)
 	})
+}
+
+// validOrigin accepts a lower-case scheme://host[:port] or scheme://host:*.
+func validOrigin(o string) bool {
+	u, err := url.Parse(strings.TrimSuffix(o, ":*"))
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.Path == "" &&
+		u.User == nil && u.RawQuery == "" && u.Fragment == "" && !(strings.HasSuffix(o, ":*") && u.Port() != "")
+}
+
+func (s *Server) allowedOrigin(origin string) bool {
+	origin = strings.ToLower(origin)
+	for _, o := range s.opts.AllowedOrigins {
+		if prefix, ok := strings.CutSuffix(o, ":*"); ok {
+			if origin == prefix {
+				return true
+			}
+			if port, ok := strings.CutPrefix(origin, prefix+":"); ok && port != "" && len(port) <= 5 && strings.Trim(port, "0123456789") == "" {
+				return true
+			}
+		} else if origin == o {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedHost reports whether the Host header names this server.
+func (s *Server) allowedHost(hostport string) bool {
+	if len(s.opts.AllowedHosts) == 0 {
+		return true
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if host == "" {
+		return false
+	}
+	for _, h := range s.opts.AllowedHosts {
+		if suffix, ok := strings.CutPrefix(h, "*."); ok {
+			if strings.HasSuffix(host, "."+suffix) {
+				return true
+			}
+		} else if host == h {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- helpers ----
@@ -334,7 +448,7 @@ func (s *Server) guide(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"client":       "Download GET /api/chat/client. Run python3 agent-room.py INVITE NAME check, then join, then listen (blocks until a request arrives, then prints it). Answer with reply REQUEST_ID --file answer.txt and run listen again. listen prints STOPPED and exits 3 when a person stops you. For a script with no model between requests, use run -- EXECUTABLE.",
 		"join":         "POST /api/chat/rooms/{room}/participants with {username,role:\"agent\"|\"person\"} returns {token,username,reclaimed}. Send Authorization: Bearer TOKEN on later calls. An agent may take back its own name once the earlier session is idle.",
-		"wait":         "GET /api/chat/rooms/{room}/wait?after=REVISION&timeout=60&work=1 returns new messages and your open requests (assignments). Each @mention of you by a person or another agent is one request.",
+		"wait":         "GET /api/chat/rooms/{room}/wait?after=REVISION&timeout=60&work=1 returns new messages and your open requests (assignments). Each @mention of you by a person or another agent is one request. People may wait too; their assignments are always empty.",
 		"receipt":      "POST /api/chat/rooms/{room}/read with {revision} after reading.",
 		"assignments":  "POST /api/chat/rooms/{room}/assignments with {assignment_id,action,request_id,text}. Actions: working, progress, question, reply, done (close without a message), failed, review, handoff (these two also need agent). Reuse request_id on retries. Any agent you @mention in your text gets its own request.",
 		"post":         "POST /api/chat/rooms/{room} with {text,revision} posts to the room while you have an open request.",
@@ -419,20 +533,37 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	member := s.member(room.ID, r)
-	if member == nil || member.Role != "agent" {
+	if member == nil {
 		s.mu.Unlock()
-		http.Error(w, "Join as an agent first.", http.StatusUnauthorized)
+		http.Error(w, "Join this room first.", http.StatusUnauthorized)
 		return
 	}
+	// People may wait for new messages too. They have no requests, cannot be
+	// stopped, and do not count as listening agents.
+	agent := member.Role == "agent"
 	if stopped(w, member) {
 		s.mu.Unlock()
 		return
 	}
-	member.Waiting++
+	touch := func() {
+		member.Seen = time.Now()
+		if agent {
+			member.LastPoll = member.Seen
+		}
+	}
+	if agent {
+		member.Waiting++
+	} else {
+		member.watching++
+	}
 	defer func() {
 		s.mu.Lock()
-		member.Waiting--
-		member.LastPoll, member.Seen = time.Now(), time.Now()
+		if agent {
+			member.Waiting--
+		} else {
+			member.watching--
+		}
+		touch()
 		s.mu.Unlock()
 	}()
 	deadline := time.NewTimer(time.Duration(timeout) * time.Second)
@@ -443,7 +574,7 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 			return
 		}
-		member.LastPoll, member.Seen = time.Now(), time.Now()
+		touch()
 		messages, err := s.store.Messages(room.ID)
 		if err != nil {
 			s.mu.Unlock()
@@ -451,8 +582,8 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		revision := len(messages)
-		var work []Request
-		if revision != after || timedOut || r.URL.Query().Get("work") == "1" {
+		work := []Request{}
+		if agent && (revision != after || timedOut || r.URL.Query().Get("work") == "1") {
 			work = pending(requests(messages), member.Name)
 		}
 		if revision != after || timedOut || len(work) > 0 {
@@ -460,7 +591,10 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 			if after > revision {
 				start = 0
 			}
-			reason := agentBlock(messages, member.Name)
+			reason := ""
+			if agent {
+				reason = agentBlock(messages, member.Name)
+			}
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"room": room, "revision": revision, "next_after": revision, "assignments": work,
@@ -706,7 +840,7 @@ func (s *Server) list(room string) []Member {
 	out := []Member{}
 	for _, m := range s.members[room] {
 		c := *m
-		c.Online = c.Waiting > 0 || time.Since(c.Seen) < 45*time.Second
+		c.Online = c.Waiting > 0 || c.watching > 0 || time.Since(c.Seen) < 45*time.Second
 		c.Listening = c.Role == "agent" && !c.Stopped && (c.Waiting > 0 || time.Since(c.LastPoll) < 20*time.Second)
 		if c.Role == "agent" {
 			switch {
@@ -740,7 +874,7 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.Username = strings.TrimSpace(in.Username)
-	if in.Username == "" || len(in.Username) > 80 || strings.IndexFunc(in.Username, unicode.IsControl) >= 0 || strings.ContainsAny(in.Username, "@\n") || (in.Role != "agent" && in.Role != "person") {
+	if in.Username == "" || utf8.RuneCountInString(in.Username) > 80 || strings.IndexFunc(in.Username, unicode.IsControl) >= 0 || strings.ContainsAny(in.Username, "@\n") || (in.Role != "agent" && in.Role != "person") {
 		http.Error(w, "Choose a name (up to 80 characters, no @) and the role agent or person.", http.StatusBadRequest)
 		return
 	}

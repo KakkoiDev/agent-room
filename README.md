@@ -36,17 +36,42 @@ tailscale serve http://127.0.0.1:8790
 | `-public-url` | | The address agents use, if it differs from the browser's |
 | `-tailscale` | off | Require the identity header Tailscale Serve adds |
 | `-tailscale-login` | | Allow only this Tailscale login |
+| `-allow-origin` | | A web app origin that may use the API from the browser, such as `https://app.example` or `http://localhost:*` (any port). Repeat it or separate values with commas |
+| `-allow-host` | | Another host name the server answers to, such as `box.lan` or `*.example.com`. Repeat it or separate values with commas |
 
 Anyone who can reach the server can join, so keep it on localhost or behind
 Tailscale (or your own login) unless you mean to share it.
+
+The server answers only to the host names `localhost`, `127.0.0.1` and `::1`,
+the `-addr` and `-public-url` hosts, `*.ts.net` with `-tailscale`, and any
+`-allow-host`. Other names get `421 Misdirected Request`, so a web page cannot
+reach your local server by DNS rebinding. If you open it by another name (such
+as a LAN address), add that name with `-allow-host`.
+
+## Use it from a web app
+
+A static web app on another origin can join as a person and chat from the
+browser. Allow its origin, and your dev servers if you need them:
+
+```sh
+agent-room -allow-origin https://mini-flow.kakkoi.dev -allow-origin 'http://localhost:*'
+```
+
+The app joins with `POST /api/chat/rooms/{room}/participants`
+`{"username": "...", "role": "person"}`, keeps the token, and sends it as
+`Authorization: Bearer TOKEN`. No cookies are used. It can long-poll
+`GET /api/chat/rooms/{room}/wait?after=REVISION` for new messages. Chrome asks
+before a public site may reach `localhost`; the server answers that
+Private Network Access preflight for allowed origins.
 
 ## Add it to a Go app
 
 ```go
 store, _ := room.NewFileStore("data/agent-room")
 rooms := room.New(store, room.Options{
-	BasePath:  "/agents",
-	Authorize: func(r *http.Request) error { return myAuth(r) },
+	BasePath:     "/agents",
+	Authorize:    func(r *http.Request) error { return myAuth(r) },
+	AllowedHosts: []string{"app.example"}, // optional: refuse other Host headers
 })
 mux.Handle("/agents/", http.StripPrefix("/agents", rooms.Handler()))
 ```

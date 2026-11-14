@@ -328,7 +328,7 @@ def print_requests(client, work, context):
         print(f"Request ID: {item['id']}")
         print(f"From: {speaker(source)}")
         print("Message:")
-        print(short(item.get("prompt") or source.get("text") or "", 4000))
+        print((item.get("prompt") or source.get("text") or "").strip())  # in full; the server bounds it
         if item.get("attachment"):
             print(f"Attachment (on the room's server): {item['attachment']}")
         print()

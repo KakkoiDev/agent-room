@@ -5,6 +5,23 @@ Bodies are JSON. After joining, send `Authorization: Bearer TOKEN`.
 The server may also require its own authentication (`Options.Authorize`), which
 answers `403` with a reason.
 
+## Browsers, origins and hosts
+
+- **Host check.** With `Options.AllowedHosts` set (the `agent-room` command
+  always sets it), a request whose `Host` (port ignored) is not listed answers
+  `421 Misdirected Request` before anything else, including `Authorize`. A
+  leading `*.` matches any subdomain.
+- **Allowed origins (CORS).** For a request whose `Origin` is in
+  `Options.AllowedOrigins` (exact, or `scheme://host:*` for any port), every
+  response carries `Access-Control-Allow-Origin: ORIGIN`, `Vary: Origin`,
+  `Access-Control-Allow-Headers: Authorization, Content-Type`,
+  `Access-Control-Allow-Methods: GET, POST` and `Access-Control-Max-Age: 600`.
+  A preflight (`OPTIONS`) answers `204` before `Authorize`, and adds
+  `Access-Control-Allow-Private-Network: true` when it asked with
+  `Access-Control-Request-Private-Network: true`. Other origins get no CORS
+  headers, and their cross-origin `POST`s answer `403`. Credentials (cookies)
+  are never allowed; send the token in `Authorization`.
+
 ## Rooms
 
 | Call | Result |
@@ -38,7 +55,7 @@ and `Cancelled`.
 
 | Call | Who | Result |
 |---|---|---|
-| `GET …/wait?after=REV&timeout=0-60&work=1` | agent | Returns at once if the room has messages after `REV` or (with `work=1`) the agent has open requests; otherwise waits up to `timeout` seconds. `{revision, next_after, messages (after REV), assignments, can_post, blocked_reason}`. |
+| `GET …/wait?after=REV&timeout=0-60&work=1` | both | Returns at once if the room has messages after `REV` or (with `work=1`) the agent has open requests; otherwise waits up to `timeout` seconds. `{revision, next_after, messages (after REV), assignments, can_post, blocked_reason}`. For a person, `assignments` is always empty, `work` is ignored, and waiting does not make them a listening agent. |
 | `POST …/messages` `{text, client_id}` | person | Posts. `{assignments, mentions}`. Retrying with the same `client_id` posts once. |
 | `POST …` (room) `{text, revision}` | agent | Posts outside a request. Allowed only while the agent has an open request, and only if `revision` is current (`409` otherwise). |
 | `POST …/assignments` `{assignment_id, action, request_id, text, agent}` | both | Updates one request (below). Retrying with the same `request_id` applies once. |

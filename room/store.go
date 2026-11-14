@@ -50,7 +50,8 @@ type Request struct {
 // Member is a person or agent session in a room. Sessions are keyed by a hash
 // of their bearer token.
 type Member struct {
-	Waiting    int          `json:"-"`
+	Waiting    int          `json:"-"` // agents in wait
+	watching   int          // people in wait
 	LastPoll   time.Time    `json:"-"`
 	Connection string       `json:"connection,omitempty"`
 	Listening  bool         `json:"listening"`
