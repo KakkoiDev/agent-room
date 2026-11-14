@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Room</title>
+<style>
+:root{--bg:#f3f5fa;--surface:#fff;--ink:#1c2540;--muted:#5b6680;--line:#dce2ef;--accent:#304ab1;--accent-soft:#e9eeff;--ok:#1d6340;--ok-soft:#e5f4ec;--warn:#784b0a;--warn-soft:#fff0d8;--quote:#eef1f8}
+@media (prefers-color-scheme:dark){:root{--bg:#11152a;--surface:#181d36;--ink:#e4e8f6;--muted:#9aa4c0;--line:#2b3355;--accent:#8ea4ff;--accent-soft:#232c55;--ok:#8fd0a6;--ok-soft:#1b3326;--warn:#f0c35e;--warn-soft:#36290f;--quote:#20274a;color-scheme:dark}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+button,input,textarea{font:inherit;color:inherit}
+.app{display:grid;grid-template-columns:200px minmax(0,1fr) 250px;gap:12px;height:100dvh;padding:12px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;min-height:0;display:flex;flex-direction:column}
+.side{padding:12px 10px;gap:8px}
+h1{font-size:15px;margin:0 4px 4px;display:flex;align-items:center;justify-content:space-between}
+h2{font-size:18px;margin:0}
+h3{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:10px 4px 4px}
+.rooms a{display:block;padding:7px 9px;border-radius:7px;color:var(--ink);text-decoration:none;font-size:14px;overflow-wrap:anywhere}
+.rooms a:hover,.rooms a[aria-current]{background:var(--accent-soft);color:var(--accent)}
+.rooms a[aria-current]{font-weight:700}
+.btn,.ghost{border-radius:7px;padding:6px 11px;cursor:pointer;font-size:13px;font-weight:650;min-height:32px}
+.btn{background:var(--accent);color:#fff;border:1px solid var(--accent)}
+@media (prefers-color-scheme:dark){.btn{color:#11152a}}
+.ghost{background:transparent;border:1px solid var(--line)}
+.ghost:hover{background:var(--accent-soft)}
+.link{background:none;border:0;color:var(--accent);cursor:pointer;font-size:12px;font-weight:650;padding:0 4px}
+input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding:7px 9px;background:var(--surface)}
+.head{padding:12px 16px;border-bottom:1px solid var(--line)}
+.head p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.log{flex:1;overflow:auto;padding:6px 18px 12px}
+.msg{padding:10px 0;border-bottom:1px solid var(--line)}
+.msg:last-child{border-bottom:0}
+.meta{display:flex;gap:7px;align-items:center;font-size:12px;color:var(--muted)}
+.meta b{color:var(--ink);font-size:13px}
+.tag{font-size:11px;font-weight:700;padding:1px 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent)}
+.text{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0 0;max-width:72ch}
+.quote{display:block;border-left:3px solid var(--line);padding-left:8px;color:var(--muted)}
+.mention{color:var(--accent);font-weight:650}
+.req{display:inline-flex;gap:6px;align-items:center;margin:6px 6px 0 0;padding:3px 8px;border:1px solid var(--line);border-radius:7px;font-size:12px}
+.status{font-weight:700;padding:0 5px;border-radius:4px;background:var(--accent-soft);color:var(--accent)}
+.status[data-s=Replied]{background:var(--ok-soft);color:var(--ok)}
+.status[data-s="Needs attention"]{background:var(--warn-soft);color:var(--warn)}
+.status[data-s=Cancelled]{background:var(--quote);color:var(--muted)}
+.compose{border-top:1px solid var(--line);padding:10px 12px;display:grid;gap:6px}
+.row{display:flex;gap:6px;align-items:center}
+.row input{flex:1}
+.hint,.feedback{font-size:12px;color:var(--muted);margin:0}
+.people{padding:12px 10px;overflow:auto}
+.person{display:flex;align-items:center;gap:7px;padding:5px 6px;border-radius:6px;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;flex:none;background:#2e9a62}
+.person[data-p=away] .dot{background:#d79a1e}
+.person[data-p=offline] .dot,.person[data-p=stopped] .dot{background:transparent;box-shadow:inset 0 0 0 1.5px var(--muted)}
+.person small{margin-left:auto;color:var(--muted)}
+.invites{display:grid;gap:6px;margin-top:12px}
+.empty{color:var(--muted);padding:20px 0}
+@media (max-width:860px){.app{grid-template-columns:minmax(0,1fr);height:auto;min-height:100dvh}.log{max-height:60dvh}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="card side">
+    <h1>Rooms <button class="link" id="new-room" title="Create a room">+ New</button></h1>
+    <nav class="rooms" id="rooms" aria-label="Rooms"></nav>
+  </aside>
+  <main class="card">
+    <header class="head"><h2 id="title">…</h2><p>@mention an agent to give it work. Agents hand work to each other the same way.</p></header>
+    <section class="log" id="log" aria-label="Messages" tabindex="0"></section>
+    <section class="compose">
+      <form class="row" id="join" hidden><label for="join-name" class="hint">Join as</label><input id="join-name" placeholder="Your name" maxlength="80" required><button class="btn">Join</button></form>
+      <form id="send" hidden><textarea id="text" rows="2" placeholder="Write a message… Use @name to ask an agent." aria-label="Message"></textarea>
+        <div class="row" style="margin-top:6px"><p class="hint" id="as"></p><span style="flex:1"></span><span class="hint">Ctrl/⌘ + Enter</span><button class="btn">Send</button></div></form>
+      <p class="feedback" id="feedback" role="status"></p>
+    </section>
+  </main>
+  <aside class="card people">
+    <h3>People</h3><div id="people"></div>
+    <h3>Agents</h3><div id="agents"></div>
+    <div class="invites"><button class="ghost" id="invite-agent">Invite an agent</button><button class="ghost" id="invite-person">Invite a person</button></div>
+  </aside>
+</div>
+<script>
+const BASE = __BASE_PATH__;
+const room = new URLSearchParams(location.search).get('room') || 'general';
+const api = BASE + '/api/chat/rooms/' + encodeURIComponent(room);
+const key = 'agent-room:' + BASE + ':' + room;
+const $ = id => document.getElementById(id);
+let me = null, lastSig = '', revision = 0;
+try { me = JSON.parse(localStorage.getItem(key)); } catch {}
+
+async function call(path, body) {
+  const headers = {'Content-Type': 'application/json'};
+  if (me) headers.Authorization = 'Bearer ' + me.token;
+  const r = await fetch(api + path, body === undefined ? {headers} : {method: 'POST', headers, body: JSON.stringify(body)});
+  if (r.status === 401 && me) { forget(); throw new Error('Your session expired. Join again.'); }
+  if (!r.ok) throw new Error((await r.text()).trim());
+  return r.status === 204 ? null : r.json();
+}
+function forget() { me = null; try { localStorage.removeItem(key); } catch {} showComposer(); }
+function say(text) { $('feedback').textContent = text; }
+function showComposer() {
+  $('join').hidden = !!me; $('send').hidden = !me;
+  $('as').textContent = me ? 'You are ' + me.username : '';
+}
+
+function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+function textWithMentions(line, names) {
+  const out = []; let rest = line;
+  const re = names.length ? new RegExp('@(' + names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?![\\w-])', 'gi') : null;
+  if (!re) return [document.createTextNode(line)];
+  let last = 0;
+  for (const m of line.matchAll(re)) { out.push(document.createTextNode(line.slice(last, m.index))); out.push(el('span', 'mention', m[0])); last = m.index + m[0].length; }
+  out.push(document.createTextNode(line.slice(last)));
+  return out;
+}
+function renderMessages(state, names) {
+  const log = $('log');
+  const nearBottom = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
+  const byMessage = new Map();
+  for (const r of state.requests || []) { if (!byMessage.has(r.source)) byMessage.set(r.source, []); byMessage.get(r.source).push(r); }
+  const nodes = [];
+  state.messages.forEach((m, i) => {
+    const reqs = byMessage.get(i) || [];
+    if (!m.text && !reqs.length) return;
+    const box = el('article', 'msg');
+    const meta = el('div', 'meta');
+    meta.append(el('b', '', m.author || 'Guest'));
+    if (m.kind === 'agent') meta.append(el('span', 'tag', 'Agent'));
+    else if (m.kind && m.kind !== 'assignment-state') meta.append(el('span', 'tag', m.kind));
+    meta.append(el('time', '', new Date(m.at).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})));
+    box.append(meta);
+    if (m.text) {
+      const p = el('p', 'text');
+      const lines = m.text.split('\n');
+      lines.forEach((line, j) => {
+        if (line.startsWith('> ')) { const q = el('span', 'quote'); q.append(...textWithMentions(line.slice(2), names)); p.append(q); }
+        else { p.append(...textWithMentions(line, names)); if (j < lines.length - 1) p.append('\n'); }
+      });
+      box.append(p);
+    }
+    for (const r of reqs) {
+      const chip = el('span', 'req');
+      chip.append(el('b', '', r.agent), el('span', 'status', r.status));
+      chip.lastChild.dataset.s = r.status;
+      if (me && r.status === 'Needs attention') chip.append(action('Retry', 'retry', r.id));
+      if (me && ['Queued', 'Working', 'Needs attention'].includes(r.status)) chip.append(action('Cancel', 'cancel', r.id));
+      box.append(chip);
+    }
+    nodes.push(box);
+  });
+  if (!nodes.length) nodes.push(el('p', 'empty', 'No messages yet. Join, then @mention an agent or use Invite to bring one in.'));
+  log.replaceChildren(...nodes);
+  if (nearBottom) log.scrollTop = log.scrollHeight;
+}
+function action(label, kind, id) {
+  const b = el('button', 'link', label);
+  b.onclick = async () => { try { await call('/assignments', {action: kind, assignment_id: id}); say(kind === 'retry' ? 'Request queued again.' : 'Request cancelled.'); tick(); } catch (e) { say(e.message); } };
+  return b;
+}
+function presence(p) {
+  if (p.role !== 'agent') return p.online ? 'online' : 'away';
+  if (p.stopped) return 'stopped';
+  return {waiting: 'listening', 'recently active': 'working'}[p.connection] || 'offline';
+}
+function renderPeople(list) {
+  const row = p => {
+    const d = el('div', 'person'); d.dataset.p = presence(p) === 'listening' || presence(p) === 'online' ? 'online' : presence(p) === 'working' ? 'away' : presence(p);
+    d.append(el('span', 'dot'), el('span', '', p.username), el('small', '', presence(p)));
+    if (p.role === 'agent' && me && !p.stopped) {
+      const b = el('button', 'link', 'Stop'); b.title = 'Ask ' + p.username + ' to stop listening';
+      b.onclick = async () => { try { await call('/participants/stop', {username: p.username}); say(p.username + ' was asked to stop.'); tick(); } catch (e) { say(e.message); } };
+      d.append(b);
+    }
+    return d;
+  };
+  const people = list.filter(p => p.role !== 'agent'), agents = list.filter(p => p.role === 'agent');
+  $('people').replaceChildren(...(people.length ? people.map(row) : [el('p', 'hint', 'No one yet.')]));
+  $('agents').replaceChildren(...(agents.length ? agents.map(row) : [el('p', 'hint', 'No agents yet. Use Invite an agent.')]));
+}
+
+async function tick() {
+  try {
+    const [state, list] = await Promise.all([call(''), call('/participants')]);
+    revision = state.revision;
+    $('title').textContent = state.room.title; document.title = state.room.title + ' · Agent Room';
+    const names = list.map(p => p.username);
+    const sig = JSON.stringify([state.revision, state.requests.map(r => r.status), !!me, names]);
+    const sel = getSelection();
+    const selecting = sel && !sel.isCollapsed && $('log').contains(sel.anchorNode);
+    if (sig !== lastSig && !selecting) { lastSig = sig; renderMessages(state, names); }
+    renderPeople(list);
+    if (me && document.visibilityState === 'visible') call('/read', {revision: state.revision}).catch(() => {});
+  } catch (e) { say(e.message); }
+}
+async function loadRooms() {
+  const rooms = await (await fetch(BASE + '/api/chat/rooms')).json();
+  $('rooms').replaceChildren(...rooms.map(r => { const a = el('a', '', r.title); a.href = BASE + '/chat?room=' + encodeURIComponent(r.id); if (r.id === room) a.setAttribute('aria-current', 'page'); return a; }));
+}
+async function copy(text, button, label) {
+  try { await navigator.clipboard.writeText(text); const old = button.textContent; button.textContent = 'Copied'; setTimeout(() => button.textContent = old, 1500); }
+  catch { const t = el('textarea'); t.value = text; t.rows = 8; t.readOnly = true; t.setAttribute('aria-label', label); button.after(t); t.select(); }
+}
+
+$('join').onsubmit = async e => {
+  e.preventDefault();
+  try { me = await call('/participants', {username: $('join-name').value, role: 'person'}); localStorage.setItem(key, JSON.stringify(me)); showComposer(); say('Joined as ' + me.username + '.'); $('text').focus(); tick(); }
+  catch (err) { say(err.message); }
+};
+$('send').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('text').value.trim(); if (!text) return;
+  try { const r = await call('/messages', {text, client_id: crypto.randomUUID()}); $('text').value = ''; say(r.assignments.length ? 'Sent. Request queued for ' + r.assignments.map(a => a.agent).join(', ') + '.' : 'Sent.'); $('log').scrollTop = 1e9; tick(); }
+  catch (err) { say(err.message); }
+};
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('send').requestSubmit(); } });
+$('invite-agent').onclick = async e => {
+  try { const r = await fetch(api + '/invite?origin=' + encodeURIComponent(location.origin)); if (!r.ok) throw new Error(await r.text()); copy(await r.text(), e.target, 'Agent invite'); }
+  catch (err) { say(err.message); }
+};
+$('invite-person').onclick = e => copy(`You're invited to the chat room "${$('title').textContent}".\n\n1. Open ${location.origin + BASE}/chat?room=${encodeURIComponent(room)}\n2. Type your name and click Join.\n3. Type @name to ask an agent or a person.`, e.target, 'Person invite');
+$('new-room').onclick = async () => {
+  const title = window.prompt('Room title'); if (!title) return;
+  try { const r = await fetch(BASE + '/api/chat/rooms', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({title})}); if (!r.ok) throw new Error(await r.text()); const created = await r.json(); location.href = BASE + '/chat?room=' + encodeURIComponent(created.id); }
+  catch (err) { say(err.message); }
+};
+showComposer(); loadRooms(); tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>

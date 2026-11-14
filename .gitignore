@@ -1,0 +1,3 @@
+/agent-room
+*.test
+__pycache__/
