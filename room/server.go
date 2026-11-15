@@ -53,6 +53,14 @@ type Options struct {
 	// subdomain, as in "*.ts.net". This stops DNS rebinding attacks on a server
 	// listening on localhost.
 	AllowedHosts []string
+	// HouseAgent names an agent that considers every message from a person that
+	// @mentions no one. It gets an "ambient" request for each one while it is in
+	// the room and answers only when needed. People can turn it off per room.
+	HouseAgent string
+	// InviteSecret signs agent invite codes. When empty, the server uses the
+	// store's secret (SecretStore) or, failing that, a random one that lasts
+	// until the process exits.
+	InviteSecret []byte
 }
 
 // Server holds the rooms' live state. Create it with New.
@@ -63,6 +71,7 @@ type Server struct {
 	members Members
 	changes map[string]chan struct{}
 	loadErr error
+	secret  []byte
 }
 
 // New loads sessions from the store and returns a server.
@@ -99,7 +108,20 @@ func New(store Store, opts Options) *Server {
 			}
 		}
 	}
-	return &Server{store: store, opts: opts, members: members, changes: map[string]chan struct{}{}, loadErr: err}
+	secret := opts.InviteSecret
+	if len(secret) == 0 {
+		if keeper, ok := store.(SecretStore); ok {
+			var keyErr error
+			if secret, keyErr = keeper.Secret(); keyErr != nil {
+				log.Printf("agent-room: could not load the invite key, so invites last until restart: %v", keyErr)
+			}
+		}
+	}
+	if len(secret) == 0 {
+		secret = []byte(rand.Text() + rand.Text())
+	}
+	opts.HouseAgent = strings.TrimSpace(opts.HouseAgent)
+	return &Server{store: store, opts: opts, members: members, changes: map[string]chan struct{}{}, loadErr: err, secret: secret}
 }
 
 // Handler serves the chat page and the API. Mount it at Options.BasePath, for
@@ -122,6 +144,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/chat/rooms/{room}", s.agentPost)
 	mux.HandleFunc("POST /api/chat/rooms/{room}/messages", s.personPost)
 	mux.HandleFunc("GET /api/chat/rooms/{room}/invite", s.invite)
+	mux.HandleFunc("POST /api/chat/rooms/{room}/invite/revoke", s.revoke)
+	mux.HandleFunc("POST /api/chat/rooms/{room}/house-agent", s.setHouse)
 	mux.HandleFunc("GET /api/chat/rooms/{room}/wait", s.wait)
 	mux.HandleFunc("POST /api/chat/rooms/{room}/read", s.read)
 	mux.HandleFunc("GET /api/chat/rooms/{room}/participants", s.participants)
@@ -447,14 +471,17 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 func (s *Server) guide(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"client":       "Download GET /api/chat/client. Run python3 agent-room.py INVITE NAME check, then join, then listen (blocks until a request arrives, then prints it). Answer with reply REQUEST_ID --file answer.txt and run listen again. listen prints STOPPED and exits 3 when a person stops you. For a script with no model between requests, use run -- EXECUTABLE.",
-		"join":         "POST /api/chat/rooms/{room}/participants with {username,role:\"agent\"|\"person\"} returns {token,username,reclaimed}. Send Authorization: Bearer TOKEN on later calls. An agent may take back its own name once the earlier session is idle.",
+		"join":         "POST /api/chat/rooms/{room}/participants with {username,role:\"agent\"|\"person\",invite} returns {token,username,reclaimed}. Agents must send the invite code from their invite link (?invite=). Send Authorization: Bearer TOKEN on later calls. An agent may take back its own name once the earlier session is idle.",
+		"check":        "GET /api/chat/rooms/{room}?invite=CODE and /participants?invite=CODE let an agent look at the room before joining. Without a session or a valid invite the room shows nothing.",
 		"wait":         "GET /api/chat/rooms/{room}/wait?after=REVISION&timeout=60&work=1 returns new messages and your open requests (assignments). Each @mention of you by a person or another agent is one request. People may wait too; their assignments are always empty.",
+		"ambient":      "A request with ambient:true was not addressed to anyone: you are the room's house agent. Answer only if the message asks a question, asks for something to be done or clearly expects a reply; otherwise close it with action done, which posts nothing.",
 		"receipt":      "POST /api/chat/rooms/{room}/read with {revision} after reading.",
 		"assignments":  "POST /api/chat/rooms/{room}/assignments with {assignment_id,action,request_id,text}. Actions: working, progress, question, reply, done (close without a message), failed, review, handoff (these two also need agent). Reuse request_id on retries. Any agent you @mention in your text gets its own request.",
 		"post":         "POST /api/chat/rooms/{room} with {text,revision} posts to the room while you have an open request.",
 		"people":       "People join with role person and post with POST /api/chat/rooms/{room}/messages {text,client_id}. They retry or cancel requests with actions retry and cancel.",
 		"stop":         "POST /api/chat/rooms/{room}/participants/stop with {username} and a person's token stops an agent. Its calls then answer 410 Gone until it joins again.",
-		"invite":       "GET /api/chat/rooms/{room}/invite?origin=URL returns the copy-paste invite for agents.",
+		"invite":       "GET /api/chat/rooms/{room}/invite?origin=URL with a person's token returns the copy-paste invite for agents, bound to that person. POST /api/chat/rooms/{room}/invite/revoke with a person's token invalidates their invites; agents that joined with them get 410 Gone.",
+		"house_agent":  "POST /api/chat/rooms/{room}/house-agent with {enabled} and a person's token turns the house agent on or off for the room.",
 		"protocol_doc": "See PROTOCOL.md in github.com/KakkoiDev/agent-room.",
 	})
 }
@@ -462,8 +489,20 @@ func (s *Server) guide(w http.ResponseWriter, r *http.Request) {
 func (s *Server) invite(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	room, ok := s.room(w, r)
-	s.mu.Unlock()
 	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	person := s.member(room.ID, r)
+	if person == nil || person.Role != "person" {
+		s.mu.Unlock()
+		http.Error(w, "Join this room as a person to invite an agent.", http.StatusUnauthorized)
+		return
+	}
+	code, err := s.personInvite(room.ID, person)
+	s.mu.Unlock()
+	if err != nil {
+		http.Error(w, "Could not save the invite.", http.StatusInternalServerError)
 		return
 	}
 	origin := s.opts.PublicURL
@@ -477,7 +516,52 @@ func (s *Server) invite(w http.ResponseWriter, r *http.Request) {
 	}
 	base := strings.TrimRight(u.Scheme+"://"+u.Host, "/") + s.opts.BasePath
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, InviteText(base, room))
+	io.WriteString(w, InviteText(base, room, code))
+}
+
+// revoke invalidates the calling person's invite codes and cuts off every agent
+// that joined with one of them.
+func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room, ok := s.room(w, r)
+	if !ok {
+		return
+	}
+	person := s.member(room.ID, r)
+	if person == nil || person.Role != "person" {
+		http.Error(w, "Join this room as a person to revoke your invites.", http.StatusUnauthorized)
+		return
+	}
+	previous := person.InviteKey
+	person.InviteKey = rand.Text()
+	if s.store.SaveMembers(s.members) != nil {
+		person.InviteKey = previous
+		http.Error(w, "Could not save the change.", http.StatusInternalServerError)
+		return
+	}
+	s.notify(room.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// viewer checks that the caller may read the room: a member with a session, or
+// anyone with a valid agent invite (how the helper's check looks before it
+// joins). The room link alone shows nothing. Callers hold s.mu.
+func (s *Server) viewer(w http.ResponseWriter, r *http.Request, room string) (*Member, bool) {
+	member := s.member(room, r)
+	switch {
+	case member != nil:
+		return member, !s.gone(w, room, member)
+	case r.Header.Get("Authorization") != "":
+		http.Error(w, "Chat session expired. Join this room again.", http.StatusUnauthorized)
+	case r.URL.Query().Get("invite") == "":
+		http.Error(w, "Join this room to see it. Agents need an invite from a person in the room.", http.StatusUnauthorized)
+	case s.inviter(room, r.URL.Query().Get("invite")) == nil:
+		http.Error(w, inviteInvalid, http.StatusForbidden)
+	default:
+		return nil, true
+	}
+	return nil, false
 }
 
 // ---- state for people and agents ----
@@ -494,17 +578,16 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Could not read the room.", http.StatusInternalServerError)
 		return
 	}
-	member := s.member(room.ID, r)
-	if r.Header.Get("Authorization") != "" && member == nil {
-		http.Error(w, "Chat session expired. Join this room again.", http.StatusUnauthorized)
+	member, ok := s.viewer(w, r, room.ID)
+	if !ok {
 		return
 	}
 	all := requests(messages)
 	result := map[string]any{"room": room, "revision": len(messages), "messages": messages, "requests": all}
+	if s.opts.HouseAgent != "" {
+		result["house_agent"] = map[string]any{"name": s.opts.HouseAgent, "enabled": houseOn(messages)}
+	}
 	if member != nil && member.Role == "agent" {
-		if stopped(w, member) {
-			return
-		}
 		member.LastPoll, member.Seen = time.Now(), time.Now()
 		reason := agentBlock(messages, member.Name)
 		result["can_post"], result["blocked_reason"] = reason == "", reason
@@ -541,7 +624,7 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 	// People may wait for new messages too. They have no requests, cannot be
 	// stopped, and do not count as listening agents.
 	agent := member.Role == "agent"
-	if stopped(w, member) {
+	if s.gone(w, room.ID, member) {
 		s.mu.Unlock()
 		return
 	}
@@ -570,7 +653,7 @@ func (s *Server) wait(w http.ResponseWriter, r *http.Request) {
 	defer deadline.Stop()
 	timedOut := timeout == 0
 	for {
-		if stopped(w, member) {
+		if s.gone(w, room.ID, member) {
 			s.mu.Unlock()
 			return
 		}
@@ -663,6 +746,7 @@ func (s *Server) personPost(w http.ResponseWriter, r *http.Request) {
 	}
 	m.Mentions = mentions(in.Text, s.members[room.ID])
 	assign(&m, m.Mentions, s.members[room.ID])
+	s.ambient(room.ID, &m, messages)
 	if s.write(room.ID, m) != nil {
 		http.Error(w, "Could not save the message.", http.StatusInternalServerError)
 		return
@@ -695,7 +779,7 @@ func (s *Server) agentPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Join as an agent first.", http.StatusUnauthorized)
 		return
 	}
-	if stopped(w, member) {
+	if s.gone(w, room.ID, member) {
 		return
 	}
 	member.Seen = time.Now()
@@ -751,7 +835,7 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Join this room first.", http.StatusUnauthorized)
 		return
 	}
-	if stopped(w, member) {
+	if s.gone(w, room.ID, member) {
 		return
 	}
 	messages, err := s.store.Messages(room.ID)
@@ -840,12 +924,15 @@ func (s *Server) list(room string) []Member {
 	out := []Member{}
 	for _, m := range s.members[room] {
 		c := *m
+		c.InviteKey = ""
 		c.Online = c.Waiting > 0 || c.watching > 0 || time.Since(c.Seen) < 45*time.Second
 		c.Listening = c.Role == "agent" && !c.Stopped && (c.Waiting > 0 || time.Since(c.LastPoll) < 20*time.Second)
 		if c.Role == "agent" {
 			switch {
 			case c.Stopped:
 				c.Connection = "stopped"
+			case !s.allowed(room, m):
+				c.Connection, c.Listening = "revoked", false
 			case c.Waiting > 0:
 				c.Connection = "waiting"
 			case c.Online:
@@ -863,13 +950,17 @@ func (s *Server) list(room string) []Member {
 func (s *Server) participants(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if room, ok := s.room(w, r); ok {
+	room, ok := s.room(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := s.viewer(w, r, room.ID); ok {
 		writeJSON(w, http.StatusOK, s.list(room.ID))
 	}
 }
 
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Username, Role string }
+	var in struct{ Username, Role, Invite string }
 	if !decode(w, r, 2048, &in) {
 		return
 	}
@@ -888,6 +979,17 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Chat sessions could not be loaded.", http.StatusServiceUnavailable)
 		return
 	}
+	// People join by name. Agents need an invite from a person in the room.
+	var inviter *Member
+	if in.Role == "agent" {
+		if inviter = s.inviter(room.ID, in.Invite); inviter == nil {
+			http.Error(w, inviteInvalid, http.StatusForbidden)
+			return
+		}
+	} else if s.opts.HouseAgent != "" && strings.EqualFold(in.Username, s.opts.HouseAgent) {
+		http.Error(w, "That name belongs to this server's house agent. Join with a different name.", http.StatusConflict)
+		return
+	}
 	if s.members[room.ID] == nil {
 		s.members[room.ID] = map[string]*Member{}
 	}
@@ -903,8 +1005,9 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// An agent may take its name back once the earlier session is idle,
-		// for example after a restart, on a new machine, or after Stop.
-		if in.Role == "agent" && m.Role == "agent" && m.Waiting == 0 && (m.Stopped || time.Since(m.Seen) > 45*time.Second) {
+		// for example after a restart, on a new machine, after Stop, or after
+		// its invite was revoked.
+		if in.Role == "agent" && m.Role == "agent" && (!s.allowed(room.ID, m) || m.Waiting == 0 && (m.Stopped || time.Since(m.Seen) > 45*time.Second)) {
 			replaced, replacedKey = m, key
 			continue
 		}
@@ -913,6 +1016,9 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	}
 	token := rand.Text()
 	member := &Member{Name: in.Username, Role: in.Role, Seen: time.Now(), Hue: (len(members)*137 + 230) % 360}
+	if inviter != nil {
+		member.InvitedBy, member.InviteKey = inviter.Name, inviter.InviteKey
+	}
 	if replaced != nil {
 		member.Name, member.Hue, member.Read, member.ReadItems = replaced.Name, replaced.Hue, replaced.Read, replaced.ReadItems
 		delete(members, replacedKey)
@@ -981,6 +1087,9 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 	m := s.member(room.ID, r)
 	if m == nil {
 		http.Error(w, "Join this room first.", http.StatusUnauthorized)
+		return
+	}
+	if s.gone(w, room.ID, m) {
 		return
 	}
 	messages, err := s.store.Messages(room.ID)

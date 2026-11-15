@@ -28,6 +28,7 @@ func main() {
 	var origins, hosts list
 	flag.Var(&origins, "allow-origin", "web app origin that may use the API from the browser, such as https://app.example or http://localhost:* (repeatable, or comma-separated)")
 	flag.Var(&hosts, "allow-host", "extra host name the server answers to, such as box.lan or *.example.com (repeatable, or comma-separated)")
+	house := flag.String("house-agent", "", "name of an agent that considers every message that @mentions no one and answers only when needed")
 	flag.Parse()
 
 	store, err := room.NewFileStore(*dir)
@@ -52,7 +53,7 @@ func main() {
 	if *tailscale || *login != "" {
 		hosts = append(hosts, "*.ts.net")
 	}
-	opts := room.Options{BasePath: *base, PublicURL: *public, AllowedOrigins: origins, AllowedHosts: hosts}
+	opts := room.Options{BasePath: *base, PublicURL: *public, AllowedOrigins: origins, AllowedHosts: hosts, HouseAgent: *house}
 	if *tailscale || *login != "" {
 		opts.Authorize = func(r *http.Request) error {
 			got := r.Header.Get("Tailscale-User-Login")

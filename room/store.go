@@ -27,6 +27,7 @@ type Message struct {
 	AssignmentStatus string    `json:"assignment_status,omitempty"`
 	OperationID      string    `json:"operation_id,omitempty"`
 	ClientID         string    `json:"client_id,omitempty"`
+	HouseAgent       string    `json:"house_agent,omitempty"` // "on" or "off" on a house-agent setting message
 	Mentions         []string  `json:"mentions,omitempty"`
 	Author           string    `json:"author,omitempty"`
 	Kind             string    `json:"kind,omitempty"`
@@ -45,6 +46,10 @@ type Request struct {
 	Status     string `json:"status,omitempty"`
 	Source     int    `json:"source"`
 	Task       int    `json:"task,omitempty"` // legacy shared tasks only
+	// Ambient marks a request the house agent got for a message that @mentions
+	// no one. The agent answers only if the message needs it and otherwise
+	// closes the request with done.
+	Ambient bool `json:"ambient,omitempty"`
 }
 
 // Member is a person or agent session in a room. Sessions are keyed by a hash
@@ -63,6 +68,13 @@ type Member struct {
 	Read       int          `json:"read"`
 	Online     bool         `json:"online"`
 	Stopped    bool         `json:"stopped,omitempty"`
+	// InvitedBy is the person whose invite an agent joined with. It is empty for
+	// agents that joined before invites existed.
+	InvitedBy string `json:"invited_by,omitempty"`
+	// InviteKey is, for a person, the key their current invite codes are made
+	// with (revoking replaces it) and, for an agent, the key of the invite it
+	// joined with. It is never sent to clients.
+	InviteKey string `json:"invite_key,omitempty"`
 }
 
 // Members maps room ID to session key to member.
@@ -79,8 +91,15 @@ type Store interface {
 	SaveMembers(Members) error
 }
 
+// SecretStore is an optional Store method. A Store that implements it keeps the
+// key invite codes are signed with, so invites survive a restart.
+type SecretStore interface {
+	Secret() ([]byte, error)
+}
+
 // FileStore keeps everything in one directory: one JSONL transcript per room,
-// a .room file per room title, and members.json for sessions.
+// a .room file per room title, members.json for sessions and invite.key for
+// the key invite codes are signed with.
 type FileStore struct{ root *os.Root }
 
 // NewFileStore opens (and creates) dir for storage.
@@ -165,6 +184,21 @@ func (s *FileStore) Append(room string, m Message) error {
 		err = closeErr
 	}
 	return err
+}
+
+const secretFile = "invite.key"
+
+// Secret returns the invite signing key, creating it on first use.
+func (s *FileStore) Secret() ([]byte, error) {
+	key, err := s.root.ReadFile(secretFile)
+	if err == nil && len(key) >= 32 {
+		return key, nil
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	key = []byte(rand.Text() + rand.Text())
+	return key, s.root.WriteFile(secretFile, key, 0o600)
 }
 
 const membersFile = "members.json"

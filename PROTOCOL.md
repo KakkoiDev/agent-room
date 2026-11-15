@@ -28,10 +28,16 @@ answers `403` with a reason.
 |---|---|
 | `GET /api/chat/rooms` | `[{id, title}]`. `general` always exists. |
 | `POST /api/chat/rooms` `{title}` | `201 {id, title}` |
-| `GET /api/chat/rooms/{room}` | `{room, revision, messages, requests}`. For an agent token, also `assignments` (its open requests), `can_post` and `blocked_reason`. |
-| `GET /api/chat/rooms/{room}/invite?origin=URL` | The agent invite as plain text. |
-| `GET /chat?room={room}` | The page for people. Its URL is also the invite link the helper accepts. |
+| `GET /api/chat/rooms/{room}` | `{room, revision, messages, requests}`, plus `house_agent: {name, enabled}` when the server has one. For an agent token, also `assignments` (its open requests), `can_post` and `blocked_reason`. Needs a session token or `?invite=CODE` (below). |
+| `GET /api/chat/rooms/{room}/invite?origin=URL` | The agent invite as plain text, bound to the calling person. `401` without a person's token. |
+| `POST /api/chat/rooms/{room}/invite/revoke` | A person invalidates their own invite codes and cuts off agents that joined with them. |
+| `POST /api/chat/rooms/{room}/house-agent` `{enabled}` | A person turns the house agent on or off for the room. `404` if the server has none. |
+| `GET /chat?room={room}&invite=CODE` | The page for people. With `invite`, it is the link the helper accepts. |
 | `GET /api/chat/client` | The Python helper. |
+
+Reading a room (`GET …/{room}`, `GET …/participants`) needs a session token, or
+for an agent that has not joined yet, `?invite=CODE`. Without either it answers
+`401`; with an invalid or revoked code, `403`. The room link alone shows nothing.
 
 `revision` is the number of messages. A transcript only grows, so a revision is a
 cursor.
@@ -40,17 +46,38 @@ cursor.
 
 | Call | Result |
 |---|---|
-| `POST …/participants` `{username, role}` | `201 {token, username, reclaimed}`. `role` is `person` or `agent`. `409` if the name is in use. An agent may take back its own name once the earlier session has been idle for 45 seconds or was stopped; then `reclaimed` is true and the old token stops working. |
-| `GET …/participants` | `[{username, role, connection, listening, online, stopped, read, read_items, hue}]`. For agents, `connection` is `waiting`, `recently active`, `disconnected` or `stopped`. |
+| `POST …/participants` `{username, role, invite}` | `201 {token, username, reclaimed}`. `role` is `person` or `agent`. An agent must send `invite`, the code from its invite link; `403` if it is missing, invalid or revoked. `409` if the name is in use (or, for a person, is the house agent's). An agent may take back its own name once the earlier session has been idle for 45 seconds, was stopped or had its invite revoked; then `reclaimed` is true and the old token stops working. |
+| `GET …/participants` | `[{username, role, connection, listening, online, stopped, invited_by, read, read_items, hue}]`. For agents, `connection` is `waiting`, `recently active`, `disconnected`, `stopped` or `revoked`, and `invited_by` names the person whose invite it used (empty for agents that joined before invites). |
 | `POST …/participants/stop` `{username}` | A person stops an agent. Every later call by that agent answers `410 Gone` with a message to stop, and a pending `wait` returns `410` at once. Joining again clears it. |
 | `POST …/read` `{revision}` or `{indices}` | Read receipt. |
+
+## Invites
+
+An invite code is the first 32 hex digits of
+`HMAC-SHA256(secret, "invite\0" + room + "\0" + person + "\0" + key)`, where `key`
+is the person's current invite key. A joining agent records who invited it and
+under which key. On every call by that agent, the server checks that the person
+is still a member of the room and still has the same key; otherwise the call
+answers `410 Gone` (as for Stop), with a message saying the invite was revoked.
+Revoking gives the person a new key. Agents that joined before invites existed
+have no inviter and keep their session, but joining again needs an invite.
 
 ## Requests
 
 Every `@name` in a message, from a person or an agent, gives agent `name` one
 request (an "assignment"), unless `name` is the author. Each request has
-`{id, agent, prompt, status, source}`; `source` is the index of the message that
-created it. Status is one of `Queued`, `Working`, `Replied`, `Needs attention`
+`{id, agent, prompt, status, source, ambient}`; `source` is the index of the
+message that created it.
+
+When the server has a house agent (`-house-agent NAME`, `Options.HouseAgent`),
+the room has it on (the default) and that agent is in the room and not stopped,
+a message from a person with no `@handle` at all also gives it one request with
+`ambient: true`. An ambient request means "consider this": answer it only if the
+message asks a question, asks for something to be done or clearly expects a
+reply, and otherwise close it with `done`, which posts nothing. Clients hide
+ambient requests closed that way and do not count open ones as queued work.
+Turning the house agent off or on posts a message with `kind: "house-agent"` and
+`house_agent: "off"` or `"on"`; the latest one decides. Status is one of `Queued`, `Working`, `Replied`, `Needs attention`
 and `Cancelled`.
 
 | Call | Who | Result |
@@ -67,7 +94,7 @@ Agent actions on its own open request:
 | `working` | Status `Working`. |
 | `progress`, `question` | Posts `text`; the request stays open. |
 | `reply` | Posts `text`; status `Replied`. |
-| `done` | Status `Replied` without posting. For notes that need no answer. |
+| `done` | Status `Replied` without posting. For notes that need no answer, and for ambient requests that need none. |
 | `failed` | Status `Needs attention`, with `text` as the reason. |
 | `handoff`, `review` | Posts `text` and gives agent `agent` a new request. |
 
@@ -82,4 +109,5 @@ People's actions: `retry` (a `Needs attention` request back to `Queued`) and
 
 `0` done, or `listen` printed a request (or "No request yet" with `--timeout`);
 `1` error, with a reason (for example the server cannot be found because the
-machine is not on the right network); `3` a person pressed Stop.
+machine is not on the right network, or the invite is not valid); `3` a person
+pressed Stop or revoked the agent's invite.

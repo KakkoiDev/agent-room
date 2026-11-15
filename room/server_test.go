@@ -53,6 +53,24 @@ func (c client) join(name, role string, want int) string {
 	return out.Token
 }
 
+// invite returns the agent invite code a person's "Invite an agent" hands out.
+func (c client) invite(person string) string {
+	c.t.Helper()
+	text := c.do("GET", "/api/chat/rooms/general/invite?origin=https://box.example", person, "", 200)
+	_, code, ok := strings.Cut(text, "&invite=")
+	if !ok {
+		c.t.Fatalf("invite has no code:\n%s", text)
+	}
+	return code[:strings.IndexByte(code, '"')]
+}
+
+// agent joins an agent with an invite code.
+func (c client) agent(name, code string, want int) string {
+	var out struct{ Token string }
+	json.Unmarshal([]byte(c.do("POST", "/api/chat/rooms/general/participants", "", `{"username":"`+name+`","role":"agent","invite":"`+code+`"}`, want)), &out)
+	return out.Token
+}
+
 func (c client) open(token string) []Request {
 	var out struct{ Assignments []Request }
 	json.Unmarshal([]byte(c.do("GET", "/api/chat/rooms/general/wait?after=999&timeout=0&work=1", token, "", 200)), &out)
@@ -75,8 +93,10 @@ func mount(t *testing.T, opts Options) (*httptest.Server, client) {
 func TestMentionsHandoffsAndStop(t *testing.T) {
 	_, c := mount(t, Options{})
 	const api = "/api/chat/rooms/general"
-	host, pi, other := c.join("Host", "person", 201), c.join("Pi", "agent", 201), c.join("Other", "agent", 201)
-	c.join("pi", "agent", 409)
+	host := c.join("Host", "person", 201)
+	code := c.invite(host)
+	pi, other := c.agent("Pi", code, 201), c.agent("Other", code, 201)
+	c.agent("pi", code, 409)
 
 	c.do("POST", api, pi, `{"text":"hello","revision":0}`, 409) // nothing assigned yet
 	c.do("POST", api+"/messages", host, `{"text":"@Pi please check","client_id":"a"}`, 200)
@@ -101,7 +121,7 @@ func TestMentionsHandoffsAndStop(t *testing.T) {
 	c.do("POST", api+"/assignments", other, `{"assignment_id":"`+again[0].ID+`","action":"reply","request_id":"late","text":"late"}`, 409)
 
 	var now struct{ Revision int }
-	json.Unmarshal([]byte(c.do("GET", api, "", "", 200)), &now)
+	json.Unmarshal([]byte(c.do("GET", api, host, "", 200)), &now)
 	done := make(chan int, 1)
 	go func() {
 		req, _ := http.NewRequest("GET", c.base+api+"/wait?timeout=5&after="+strconv.Itoa(now.Revision), nil)
@@ -123,11 +143,11 @@ func TestMentionsHandoffsAndStop(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("stop did not wake the waiting agent")
 	}
-	if got := c.do("GET", api+"/participants", "", "", 200); !strings.Contains(got, `"connection":"stopped"`) {
+	if got := c.do("GET", api+"/participants", host, "", 200); !strings.Contains(got, `"connection":"stopped"`) {
 		t.Fatal(got)
 	}
 	var back struct{ Reclaimed bool }
-	json.Unmarshal([]byte(c.do("POST", api+"/participants", "", `{"username":"Pi","role":"agent"}`, 201)), &back)
+	json.Unmarshal([]byte(c.do("POST", api+"/participants", "", `{"username":"Pi","role":"agent","invite":"`+code+`"}`, 201)), &back)
 	if !back.Reclaimed {
 		t.Fatal("stopped agent could not take its name back")
 	}
@@ -136,13 +156,15 @@ func TestMentionsHandoffsAndStop(t *testing.T) {
 
 func TestInviteUsesBasePath(t *testing.T) {
 	_, c := mount(t, Options{BasePath: "/agents"})
-	text := c.do("GET", "/api/chat/rooms/general/invite?origin=https://box.example", "", "", 200)
-	for _, want := range []string{`"https://box.example/agents/chat?room=general"`, "https://box.example/agents/api/chat/client", "listen --timeout 500", "STOPPED"} {
+	c.do("GET", "/api/chat/rooms/general/invite?origin=https://box.example", "", "", 401) // only a person in the room can invite
+	host := c.join("Host", "person", 201)
+	text := c.do("GET", "/api/chat/rooms/general/invite?origin=https://box.example", host, "", 200)
+	for _, want := range []string{`"https://box.example/agents/chat?room=general&invite=`, "https://box.example/agents/api/chat/client", "listen --timeout 500", "STOPPED"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("invite missing %q:\n%s", want, text)
 		}
 	}
-	c.do("GET", "/api/chat/rooms/general/invite?origin=javascript:alert(1)", "", "", 400)
+	c.do("GET", "/api/chat/rooms/general/invite?origin=javascript:alert(1)", host, "", 400)
 	if page := c.do("GET", "/chat", "", "", 200); !strings.Contains(page, `const BASE = "/agents";`) {
 		t.Fatal("page does not know its base path")
 	}
@@ -163,16 +185,18 @@ func TestHelperEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not installed")
 	}
-	srv, c := mount(t, Options{BasePath: "/agents"})
+	srv, c := mount(t, Options{BasePath: "/agents", HouseAgent: "bot"})
 	dir := t.TempDir()
 	script := filepath.Join(dir, "agent-room.py")
 	if err := os.WriteFile(script, []byte(c.do("GET", "/api/chat/client", "", "", 200)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	invite := srv.URL + "/agents/chat?room=general"
+	host := c.join("Host", "person", 201)
+	invite := srv.URL + "/agents/chat?room=general&invite=" + c.invite(host)
+	link := invite
 	helper := func(want int, args ...string) string {
 		t.Helper()
-		cmd := exec.Command("python3", append([]string{"-I", script, invite, "bot"}, args...)...)
+		cmd := exec.Command("python3", append([]string{"-I", script, link, "bot"}, args...)...)
 		cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+dir)
 		out, err := cmd.CombinedOutput()
 		code := 0
@@ -187,6 +211,15 @@ func TestHelperEndToEnd(t *testing.T) {
 		}
 		return string(out)
 	}
+	link = srv.URL + "/agents/chat?room=general" // the room link alone
+	if out := helper(1, "check"); !strings.Contains(out, "no invite code") {
+		t.Fatal(out)
+	}
+	link = invite + "0"
+	if out := helper(1, "check"); !strings.Contains(out, "not valid") {
+		t.Fatal(out)
+	}
+	link = invite
 	if out := helper(0, "check"); !strings.Contains(out, "OK: this machine can reach") {
 		t.Fatal(out)
 	}
@@ -196,7 +229,6 @@ func TestHelperEndToEnd(t *testing.T) {
 	if out := helper(0, "listen", "--timeout", "1"); !strings.Contains(out, "No request yet") {
 		t.Fatal(out)
 	}
-	host := c.join("Host", "person", 201)
 	long := strings.Repeat("x", 6000) // longer prompts used to be cut at 4,000 characters
 	c.do("POST", "/api/chat/rooms/general/messages", host, `{"text":"@bot what is 2+2? `+long+` END"}`, 200)
 	out := helper(0, "listen", "--timeout", "5")
@@ -207,8 +239,31 @@ func TestHelperEndToEnd(t *testing.T) {
 	if out := helper(0, "reply", id, "4"); !strings.Contains(out, "Reply sent") {
 		t.Fatal(out)
 	}
-	if got := c.do("GET", "/api/chat/rooms/general", "", "", 200); !strings.Contains(got, `"text":"4"`) {
+	if got := c.do("GET", "/api/chat/rooms/general", host, "", 200); !strings.Contains(got, `"text":"4"`) {
 		t.Fatal("reply missing from the room")
+	}
+	// bot is the house agent: an untagged message reaches it as an ambient request.
+	c.do("POST", "/api/chat/rooms/general/messages", host, `{"text":"thanks, that is all for today"}`, 200)
+	out = helper(0, "listen", "--timeout", "5")
+	if !strings.Contains(out, "Ambient: yes") || !strings.Contains(out, "done REQUEST_ID") {
+		t.Fatal(out)
+	}
+	id = strings.TrimSpace(strings.SplitN(strings.SplitN(out, "Request ID: ", 2)[1], "\n", 2)[0])
+	if out := helper(0, "done", id); !strings.Contains(out, "Request closed") {
+		t.Fatal(out)
+	}
+	// Revoking the invite cuts the agent off; it exits like a stopped agent.
+	c.do("POST", "/api/chat/rooms/general/invite/revoke", host, `{}`, 204)
+	if out := helper(3, "listen", "--timeout", "5"); !strings.Contains(out, "revoked") {
+		t.Fatal(out)
+	}
+	if out := helper(1, "join"); !strings.Contains(out, "not valid") {
+		t.Fatal(out)
+	}
+	invite = srv.URL + "/agents/chat?room=general&invite=" + c.invite(host)
+	link = invite
+	if out := helper(0, "join"); !strings.Contains(out, "took it over") {
+		t.Fatal(out)
 	}
 	c.do("POST", "/api/chat/rooms/general/participants/stop", host, `{"username":"bot"}`, 204)
 	if out := helper(3, "listen", "--timeout", "5"); !strings.Contains(out, "STOPPED") {
@@ -292,7 +347,9 @@ func TestCORS(t *testing.T) {
 	if res, _ := post("http://localhost:5173.evil.example", "cross-site", "forged"); res.StatusCode != 403 {
 		t.Fatalf("lookalike origin post: %d", res.StatusCode)
 	}
-	res, body := fetch(t, "GET", c.base+"/api/chat/rooms/general", map[string]string{"Origin": app}, "")
+	// Reading a room needs a session (or an agent invite), from any origin.
+	viewer := c.join("Viewer", "person", 201)
+	res, body := fetch(t, "GET", c.base+"/api/chat/rooms/general", map[string]string{"Origin": app, "Authorization": "Bearer " + viewer}, "")
 	if res.StatusCode != 200 || res.Header.Get("Access-Control-Allow-Origin") != app || strings.Contains(body, "forged") || !strings.Contains(body, "from dev") {
 		t.Fatalf("allowed get: %d %v %s", res.StatusCode, res.Header, body)
 	}
@@ -326,7 +383,8 @@ func TestHostCheck(t *testing.T) {
 func TestPersonWait(t *testing.T) {
 	_, c := mount(t, Options{})
 	const api = "/api/chat/rooms/general"
-	alice, bob, bot := c.join("Alice", "person", 201), c.join("Bob", "person", 201), c.join("bot", "agent", 201)
+	alice, bob := c.join("Alice", "person", 201), c.join("Bob", "person", 201)
+	bot := c.agent("bot", c.invite(alice), 201)
 	c.do("GET", api+"/wait?after=0&timeout=0", "", "", 401)
 
 	type update struct {
@@ -343,7 +401,7 @@ func TestPersonWait(t *testing.T) {
 		done <- u
 	}()
 	time.Sleep(100 * time.Millisecond)
-	if got := c.do("GET", api+"/participants", "", "", 200); strings.Count(got, `"listening":true`) != 0 || !strings.Contains(got, `"username":"Bob","role":"person","seen"`) {
+	if got := c.do("GET", api+"/participants", alice, "", 200); strings.Count(got, `"listening":true`) != 0 || !strings.Contains(got, `"username":"Bob","role":"person","seen"`) {
 		t.Fatalf("a waiting person counts as listening: %s", got)
 	}
 	c.do("POST", api+"/messages", alice, `{"text":"@bot hi @Bob"}`, 200)
@@ -370,4 +428,197 @@ func TestJoinNameLengthCountsCharacters(t *testing.T) {
 	_, c := mount(t, Options{})
 	c.join(strings.Repeat("あ", 80), "person", 201)
 	c.join(strings.Repeat("い", 81), "person", 400)
+}
+
+func TestAgentsNeedAValidInvite(t *testing.T) {
+	store := NewMemoryStore()
+	// An agent session from before invites existed: no inviter.
+	store.SaveMembers(Members{"general": {sessionKey("old-token"): {Name: "Old", Role: "agent"}}})
+	s := New(store, Options{})
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	c := client{t, srv.URL}
+	const api = "/api/chat/rooms/general"
+
+	// The room link alone shows nothing and lets no agent in.
+	c.do("GET", api, "", "", 401)
+	c.do("GET", api+"/participants", "", "", 401)
+	c.agent("Bot", "", 403)
+	c.agent("Bot", "0123456789abcdef0123456789abcdef", 403)
+
+	host, guest := c.join("Host", "person", 201), c.join("Guest", "person", 201)
+	code := c.invite(host)
+	if again := c.invite(host); again != code {
+		t.Fatal("a person's invite changed without a revoke")
+	}
+	if c.invite(guest) == code {
+		t.Fatal("two people share an invite")
+	}
+	if other, _ := s.InviteCode("elsewhere", "Host"); other != "" {
+		t.Fatal("invite for a room the person is not in")
+	}
+	c.do("GET", api+"?invite=nope", "", "", 403)
+	c.do("GET", api+"?invite="+code, "", "", 200) // check
+	c.do("GET", api+"/participants?invite="+code, "", "", 200)
+
+	bot := c.agent("Bot", code, 201)
+	guests := c.agent("GuestBot", c.invite(guest), 201)
+	if got := c.do("GET", api+"/participants", host, "", 200); !strings.Contains(got, `"invited_by":"Host"`) || strings.Contains(got, "invite_key") {
+		t.Fatal(got)
+	}
+	c.do("POST", api+"/messages", host, `{"text":"@Bot @GuestBot @Old hello","client_id":"a"}`, 200)
+	if len(c.open(bot)) != 1 || len(c.open(guests)) != 1 || len(c.open("old-token")) != 1 {
+		t.Fatal("invited and legacy agents should all get requests")
+	}
+
+	// Host revokes: Host's agents are cut off at once (a waiting one too), others keep working.
+	done := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequest("GET", c.base+api+"/wait?timeout=5&after=1", nil)
+		req.Header.Set("Authorization", "Bearer "+bot)
+		if res, err := http.DefaultClient.Do(req); err == nil {
+			res.Body.Close()
+			done <- res.StatusCode
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	c.do("POST", api+"/invite/revoke", bot, `{}`, 401) // agents cannot revoke
+	c.do("POST", api+"/invite/revoke", host, `{}`, 204)
+	select {
+	case code := <-done:
+		if code != http.StatusGone {
+			t.Fatalf("revoked wait: %d", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("revoking did not wake the waiting agent")
+	}
+	for _, path := range []string{api, api + "/participants", api + "/wait?after=0&timeout=0"} {
+		if got := c.do("GET", path, bot, "", 410); !strings.Contains(got, "revoked") {
+			t.Fatal(got)
+		}
+	}
+	c.do("POST", api+"/read", bot, `{"revision":1}`, 410)
+	if got := c.do("GET", api+"/participants", host, "", 200); !strings.Contains(got, `"connection":"revoked"`) {
+		t.Fatal(got)
+	}
+	c.open(guests)
+	c.open("old-token")
+	c.agent("Bot2", code, 403) // the old code no longer works
+	c.do("GET", api+"?invite="+code, "", "", 403)
+
+	// A new invite works, and takes the revoked agent's name back at once.
+	var back struct{ Reclaimed bool }
+	json.Unmarshal([]byte(c.do("POST", api+"/participants", "", `{"username":"Bot","role":"agent","invite":"`+c.invite(host)+`"}`, 201)), &back)
+	if !back.Reclaimed {
+		t.Fatal("revoked agent's name was not reclaimable")
+	}
+	// A legacy agent cannot join again without an invite.
+	c.agent("Old", "", 403)
+}
+
+func TestHouseAgentAnswersUntaggedMessages(t *testing.T) {
+	_, c := mount(t, Options{HouseAgent: "mini"})
+	const api = "/api/chat/rooms/general"
+	host := c.join("Host", "person", 201)
+	c.join("Mini", "person", 409) // the house agent's name is reserved
+	var before struct {
+		Requests []Request
+	}
+	c.do("POST", api+"/messages", host, `{"text":"anyone around?","client_id":"0"}`, 200)
+	json.Unmarshal([]byte(c.do("GET", api, host, "", 200)), &before)
+	if len(before.Requests) != 0 {
+		t.Fatal("ambient request for a house agent that is not in the room")
+	}
+
+	code := c.invite(host)
+	mini, pi := c.agent("mini", code, 201), c.agent("Pi", code, 201)
+	post := func(id, text string) []Request {
+		var out struct{ Assignments []Request }
+		json.Unmarshal([]byte(c.do("POST", api+"/messages", host, `{"text":"`+text+`","client_id":"`+id+`"}`, 200)), &out)
+		return out.Assignments
+	}
+	if got := post("a", "what is 2+2?"); len(got) != 1 || got[0].Agent != "mini" || !got[0].Ambient {
+		t.Fatalf("untagged: %+v", got)
+	}
+	if got := post("b", "@Pi thoughts?"); len(got) != 1 || got[0].Agent != "Pi" || got[0].Ambient {
+		t.Fatalf("tagged an agent: %+v", got)
+	}
+	if got := post("c", "@Host can you look?"); len(got) != 0 {
+		t.Fatalf("tagged a person: %+v", got)
+	}
+	if got := post("d", "@everyone lunch?"); len(got) != 0 {
+		t.Fatalf("tagged everyone: %+v", got)
+	}
+	if got := post("e", "mail me at a@b.example"); len(got) != 1 || !got[0].Ambient {
+		t.Fatalf("an email address is not a tag: %+v", got)
+	}
+	if got := post("f", "@mini summarize"); len(got) != 1 || got[0].Ambient {
+		t.Fatalf("@mini: %+v", got)
+	}
+	// Agents' own messages never go to the house agent.
+	c.do("POST", api+"/assignments", pi, `{"assignment_id":"`+c.open(pi)[0].ID+`","action":"reply","request_id":"p","text":"four"}`, 204)
+
+	work := c.open(mini)
+	if len(work) != 3 || !work[0].Ambient || !work[1].Ambient || work[2].Ambient {
+		t.Fatalf("mini's work: %+v", work)
+	}
+	// It stays silent on an ambient request by closing it with done.
+	c.do("POST", api+"/assignments", mini, `{"assignment_id":"`+work[1].ID+`","action":"done"}`, 204)
+	if len(c.open(mini)) != 2 {
+		t.Fatal("done did not close the ambient request")
+	}
+
+	// A person turns it off for the room; the setting is in the transcript.
+	c.do("POST", api+"/house-agent", mini, `{"enabled":false}`, 401)
+	c.do("POST", api+"/house-agent", host, `{"enabled":false}`, 204)
+	if got := post("g", "just thinking out loud"); len(got) != 0 {
+		t.Fatalf("house agent off: %+v", got)
+	}
+	var state struct {
+		HouseAgent struct {
+			Name    string
+			Enabled bool
+		} `json:"house_agent"`
+	}
+	json.Unmarshal([]byte(c.do("GET", api, host, "", 200)), &state)
+	if state.HouseAgent.Name != "mini" || state.HouseAgent.Enabled {
+		t.Fatalf("state: %+v", state)
+	}
+	c.do("POST", api+"/house-agent", host, `{"enabled":true}`, 204)
+	if got := post("h", "back on?"); len(got) != 1 || !got[0].Ambient {
+		t.Fatalf("house agent on: %+v", got)
+	}
+
+	// A stopped house agent gets nothing.
+	c.do("POST", api+"/participants/stop", host, `{"username":"mini"}`, 204)
+	if got := post("i", "hello again"); len(got) != 0 {
+		t.Fatalf("stopped house agent: %+v", got)
+	}
+
+	// Without -house-agent, the setting does not exist.
+	_, plain := mount(t, Options{})
+	plain.do("POST", api+"/house-agent", plain.join("Host", "person", 201), `{"enabled":false}`, 404)
+}
+
+func TestInvitesSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	start := func() *Server {
+		store, err := NewFileStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { store.Close() })
+		return New(store, Options{})
+	}
+	first := start()
+	srv := httptest.NewServer(first.Handler())
+	client{t, srv.URL}.join("Host", "person", 201)
+	srv.Close()
+	code, err := first.InviteCode("general", "Host")
+	if err != nil || code == "" {
+		t.Fatal(code, err)
+	}
+	if again, _ := start().InviteCode("general", "Host"); again != code {
+		t.Fatal("invite changed after a restart")
+	}
 }

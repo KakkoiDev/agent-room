@@ -37,6 +37,7 @@ input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding
 .text{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0 0;max-width:72ch}
 .quote{display:block;border-left:3px solid var(--line);padding-left:8px;color:var(--muted)}
 .mention{color:var(--accent);font-weight:650}
+.req[data-ambient]{border-style:dashed}
 .req{display:inline-flex;gap:6px;align-items:center;margin:6px 6px 0 0;padding:3px 8px;border:1px solid var(--line);border-radius:7px;font-size:12px}
 .status{font-weight:700;padding:0 5px;border-radius:4px;background:var(--accent-soft);color:var(--accent)}
 .status[data-s=Replied]{background:var(--ok-soft);color:var(--ok)}
@@ -50,7 +51,7 @@ input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding
 .person{display:flex;align-items:center;gap:7px;padding:5px 6px;border-radius:6px;font-size:13px}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;background:#2e9a62}
 .person[data-p=away] .dot{background:#d79a1e}
-.person[data-p=offline] .dot,.person[data-p=stopped] .dot{background:transparent;box-shadow:inset 0 0 0 1.5px var(--muted)}
+.person[data-p=offline] .dot,.person[data-p=stopped] .dot,.person[data-p=revoked] .dot{background:transparent;box-shadow:inset 0 0 0 1.5px var(--muted)}
 .person small{margin-left:auto;color:var(--muted)}
 .invites{display:grid;gap:6px;margin-top:12px}
 .empty{color:var(--muted);padding:20px 0}
@@ -64,7 +65,8 @@ input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding
     <nav class="rooms" id="rooms" aria-label="Rooms"></nav>
   </aside>
   <main class="card">
-    <header class="head"><h2 id="title">…</h2><p>@mention an agent to give it work. Agents hand work to each other the same way.</p></header>
+    <header class="head"><h2 id="title">…</h2><p>@mention an agent to give it work. Agents hand work to each other the same way.</p>
+      <p id="house" hidden><span id="house-text"></span> <button class="link" id="house-toggle"></button></p></header>
     <section class="log" id="log" aria-label="Messages" tabindex="0"></section>
     <section class="compose">
       <form class="row" id="join" hidden><label for="join-name" class="hint">Join as</label><input id="join-name" placeholder="Your name" maxlength="80" required><button class="btn">Join</button></form>
@@ -76,7 +78,8 @@ input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding
   <aside class="card people">
     <h3>People</h3><div id="people"></div>
     <h3>Agents</h3><div id="agents"></div>
-    <div class="invites"><button class="ghost" id="invite-agent">Invite an agent</button><button class="ghost" id="invite-person">Invite a person</button></div>
+    <div class="invites"><button class="ghost" id="invite-agent">Invite an agent</button><button class="ghost" id="invite-person">Invite a person</button>
+      <button class="link" id="revoke" hidden title="Your earlier agent invites stop working and the agents that joined with them are cut off">Revoke my agent invites</button></div>
   </aside>
 </div>
 <script>
@@ -99,7 +102,7 @@ async function call(path, body) {
 function forget() { me = null; try { localStorage.removeItem(key); } catch {} showComposer(); }
 function say(text) { $('feedback').textContent = text; }
 function showComposer() {
-  $('join').hidden = !!me; $('send').hidden = !me;
+  $('join').hidden = !!me; $('send').hidden = !me; $('revoke').hidden = !me;
   $('as').textContent = me ? 'You are ' + me.username : '';
 }
 
@@ -139,7 +142,9 @@ function renderMessages(state, names) {
       box.append(p);
     }
     for (const r of reqs) {
+      if (r.ambient && r.status === 'Replied') continue; // the house agent read it and had nothing to add
       const chip = el('span', 'req');
+      if (r.ambient) { chip.dataset.ambient = ''; chip.title = 'This message tagged no one, so ' + r.agent + ' answers only if it needs an answer.'; }
       chip.append(el('b', '', r.agent), el('span', 'status', r.status));
       chip.lastChild.dataset.s = r.status;
       if (me && r.status === 'Needs attention') chip.append(action('Retry', 'retry', r.id));
@@ -148,7 +153,7 @@ function renderMessages(state, names) {
     }
     nodes.push(box);
   });
-  if (!nodes.length) nodes.push(el('p', 'empty', 'No messages yet. Join, then @mention an agent or use Invite to bring one in.'));
+  if (!nodes.length) nodes.push(el('p', 'empty', me ? 'No messages yet. @mention an agent, or use Invite an agent to bring one in.' : 'Join with your name to see the conversation.'));
   log.replaceChildren(...nodes);
   if (nearBottom) log.scrollTop = log.scrollHeight;
 }
@@ -160,13 +165,15 @@ function action(label, kind, id) {
 function presence(p) {
   if (p.role !== 'agent') return p.online ? 'online' : 'away';
   if (p.stopped) return 'stopped';
+  if (p.connection === 'revoked') return 'revoked';
   return {waiting: 'listening', 'recently active': 'working'}[p.connection] || 'offline';
 }
 function renderPeople(list) {
   const row = p => {
     const d = el('div', 'person'); d.dataset.p = presence(p) === 'listening' || presence(p) === 'online' ? 'online' : presence(p) === 'working' ? 'away' : presence(p);
     d.append(el('span', 'dot'), el('span', '', p.username), el('small', '', presence(p)));
-    if (p.role === 'agent' && me && !p.stopped) {
+    if (p.role === 'agent') d.title = p.invited_by ? 'Invited by ' + p.invited_by : 'Joined before agent invites';
+    if (p.role === 'agent' && me && !p.stopped && p.connection !== 'revoked') {
       const b = el('button', 'link', 'Stop'); b.title = 'Ask ' + p.username + ' to stop listening';
       b.onclick = async () => { try { await call('/participants/stop', {username: p.username}); say(p.username + ' was asked to stop.'); tick(); } catch (e) { say(e.message); } };
       d.append(b);
@@ -179,10 +186,21 @@ function renderPeople(list) {
 }
 
 async function tick() {
+  if (!me) { // the room shows nothing until you join
+    if (lastSig !== 'out') { lastSig = 'out'; renderMessages({messages: []}, []); renderPeople([]); $('house').hidden = true; }
+    return;
+  }
   try {
     const [state, list] = await Promise.all([call(''), call('/participants')]);
     revision = state.revision;
     $('title').textContent = state.room.title; document.title = state.room.title + ' · Agent Room';
+    const house = state.house_agent;
+    $('house').hidden = !house;
+    if (house) {
+      $('house-text').textContent = house.enabled ? 'Messages that @mention no one go to ' + house.name + ', which answers only when needed.' : house.name + ' is off for messages that @mention no one.';
+      $('house-toggle').textContent = house.enabled ? 'Turn off' : 'Turn on';
+      $('house-toggle').onclick = async () => { try { await call('/house-agent', {enabled: !house.enabled}); tick(); } catch (e) { say(e.message); } };
+    }
     const names = list.map(p => p.username);
     const sig = JSON.stringify([state.revision, state.requests.map(r => r.status), !!me, names]);
     const sel = getSelection();
@@ -194,6 +212,8 @@ async function tick() {
 }
 async function loadRooms() {
   const rooms = await (await fetch(BASE + '/api/chat/rooms')).json();
+  const current = rooms.find(r => r.id === room);
+  if (current && !me) { $('title').textContent = current.title; document.title = current.title + ' · Agent Room'; }
   $('rooms').replaceChildren(...rooms.map(r => { const a = el('a', '', r.title); a.href = BASE + '/chat?room=' + encodeURIComponent(r.id); if (r.id === room) a.setAttribute('aria-current', 'page'); return a; }));
 }
 async function copy(text, button, label) {
@@ -209,13 +229,18 @@ $('join').onsubmit = async e => {
 $('send').onsubmit = async e => {
   e.preventDefault();
   const text = $('text').value.trim(); if (!text) return;
-  try { const r = await call('/messages', {text, client_id: crypto.randomUUID()}); $('text').value = ''; say(r.assignments.length ? 'Sent. Request queued for ' + r.assignments.map(a => a.agent).join(', ') + '.' : 'Sent.'); $('log').scrollTop = 1e9; tick(); }
+  try { const r = await call('/messages', {text, client_id: crypto.randomUUID()}); $('text').value = ''; const asked = (r.assignments || []).filter(a => !a.ambient); say(asked.length ? 'Sent. Request queued for ' + asked.map(a => a.agent).join(', ') + '.' : 'Sent.'); $('log').scrollTop = 1e9; tick(); }
   catch (err) { say(err.message); }
 };
 $('text').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('send').requestSubmit(); } });
 $('invite-agent').onclick = async e => {
-  try { const r = await fetch(api + '/invite?origin=' + encodeURIComponent(location.origin)); if (!r.ok) throw new Error(await r.text()); copy(await r.text(), e.target, 'Agent invite'); }
+  if (!me) { say('Join first: an agent invite is made by you, and the agent keeps access only while your invite is valid.'); return; }
+  try { const r = await fetch(api + '/invite?origin=' + encodeURIComponent(location.origin), {headers: {Authorization: 'Bearer ' + me.token}}); if (!r.ok) throw new Error((await r.text()).trim()); copy(await r.text(), e.target, 'Agent invite'); }
   catch (err) { say(err.message); }
+};
+$('revoke').onclick = async () => {
+  if (!confirm('Revoke your agent invites? Agents that joined with them stop at once, and your earlier invite links stop working.')) return;
+  try { await call('/invite/revoke', {}); say('Your agent invites were revoked. Use Invite an agent for a new one.'); tick(); } catch (e) { say(e.message); }
 };
 $('invite-person').onclick = e => copy(`You're invited to the chat room "${$('title').textContent}".\n\n1. Open ${location.origin + BASE}/chat?room=${encodeURIComponent(room)}\n2. Type your name and click Join.\n3. Type @name to ask an agent or a person.`, e.target, 'Person invite');
 $('new-room').onclick = async () => {

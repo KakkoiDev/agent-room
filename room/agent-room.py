@@ -2,7 +2,9 @@
 """agent-room helper: lets an AI agent join a chat room of people and agents.
 
 Connects an agent to one room. It only talks to the server in the invite link
-and keeps its login token in ~/.local/state/agent-room/.
+and keeps its login token in ~/.local/state/agent-room/. The link carries an
+invite code (?invite=) from the person who invited you; the room lets you in only
+while that invite is valid.
 
 Typical use:
   check    confirm this machine can reach the room
@@ -10,9 +12,11 @@ Typical use:
   listen   wait until someone @mentions you, print the request, then exit
   reply    answer a request (progress and question keep it open)
   done     close a request that needs no answer, without posting
+           (an "ambient" request, for a message that tagged no one, usually does)
   run      for a local worker script: keep listening and run it per request
 
-Exit codes: 0 done (or a request arrived), 1 error, 3 a person asked you to stop.
+Exit codes: 0 done (or a request arrived), 1 error, 3 a person asked you to stop
+(or revoked your invite).
 """
 
 import argparse
@@ -52,7 +56,7 @@ def main():
     parser.add_argument("invite", help="The chat link from the invite")
     parser.add_argument("name", help="Your agent name in this room; use the same one in every command")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("check", help="Check that this machine can reach the room")
+    commands.add_parser("check", help="Check that this machine can reach the room and the invite is valid")
     commands.add_parser("join", help="Join the room and show a short summary")
     commands.add_parser("read", help="Print the whole room as JSON and mark it read")
     wait = commands.add_parser("wait", help="Wait up to 60 seconds for new messages (JSON)")
@@ -75,7 +79,8 @@ def main():
         command.add_argument("--request-id", help="Reuse this ID when retrying the same message")
     done = commands.add_parser("done", help="Close a request that needs no answer, without posting")
     done.add_argument("assignment", help="The request ID")
-    run = commands.add_parser("run", help="Keep listening and run a local worker for each request")
+    run = commands.add_parser("run", help="Keep listening and run a local worker for each request "
+                              "(for an ambient request, empty output closes it with done)")
     run.add_argument("worker", nargs=argparse.REMAINDER, help="Worker executable and arguments, after --")
     args = parser.parse_args()
     if args.command == "run":
@@ -109,6 +114,8 @@ def main():
 class Client:
     def __init__(self, origin, room, name, invite):
         self.origin, self.room, self.name, self.invite = origin, room, name, invite
+        # The invite code ties this agent to the person who invited it.
+        self.code = parse_qs(urlsplit(invite).query).get("invite", [""])[0]
         self.host = urlsplit(origin).hostname
         self.api = f"{origin}/api/chat/rooms/{quote(room, safe='')}"
         state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agent-room"
@@ -148,11 +155,17 @@ class Client:
                 raise Stopped(error.read(1024).decode(errors="replace").strip()) from None
             raise
 
+    def need_code(self):
+        if not self.code:
+            raise Fatal("This link has no invite code. Ask a person in the room to click "
+                        "Invite an agent and give you the invite it copies.")
+
     def join(self):
+        self.need_code()
         try:
-            result = self.request("/participants", {"username": self.name, "role": "agent"}, auth=False)
+            result = self.request("/participants", {"username": self.name, "role": "agent", "invite": self.code}, auth=False)
         except HTTPError as error:
-            if error.code == 409:
+            if error.code in (403, 409):
                 raise Fatal(error.read(1024).decode(errors="replace").strip()) from None
             raise
         self.state["token"] = result["token"]
@@ -241,8 +254,15 @@ def cmd_check(client, args):
     guide = client.request(url=client.origin + "/api/chat", auth=False)
     if not isinstance(guide, dict):
         raise Fatal("The server did not answer like an agent-room server.")
-    room = client.request(auth=False)
-    people = client.request("/participants", auth=False) or []
+    client.need_code()
+    q = "?invite=" + quote(client.code, safe="")
+    try:
+        room = client.request(q, auth=False)
+    except HTTPError as error:
+        if error.code == 403:
+            raise Fatal(error.read(1024).decode(errors="replace").strip()) from None
+        raise
+    people = client.request("/participants" + q, auth=False) or []
     title = (room.get("room") or {}).get("title", client.room)
     print(f'OK: this machine can reach the room "{title}" '
           f"({len(people)} member{'s' if len(people) != 1 else ''}, {room.get('revision', 0)} messages).")
@@ -327,6 +347,8 @@ def print_requests(client, work, context):
         source = messages[item["source"]] if 0 <= item.get("source", -1) < len(messages) else {}
         print(f"Request ID: {item['id']}")
         print(f"From: {speaker(source)}")
+        if item.get("ambient"):
+            print("Ambient: yes. This message @mentioned no one; you got it as the room's house agent.")
         print("Message:")
         print((item.get("prompt") or source.get("text") or "").strip())  # in full; the server bounds it
         if item.get("attachment"):
@@ -339,6 +361,11 @@ def print_requests(client, work, context):
             print(f"- {speaker(m)}: {short(m['text'], 400)}")
         print()
     first = work[0]["id"]
+    if any(item.get("ambient") for item in work):
+        print("For an ambient request, answer only if the message asks a question, asks for something")
+        print("to be done, or clearly expects a reply. Otherwise (notes, thinking out loud, thanks, a")
+        print("greeting to others) close it without posting:")
+        print("  " + client.cmd("done REQUEST_ID"))
     print("Next: do the work, write your answer to a file, then send it with")
     print("  " + client.cmd(f"reply {first} --file answer.txt"))
     print("Use progress instead of reply for an update that keeps the request open,")
@@ -399,6 +426,7 @@ def cmd_run(client, args):
             full = client.call()
             full["assignment"] = item
             action, reply = "reply", ""
+            ambient = bool(item.get("ambient"))
             try:
                 result = subprocess.run(args.worker, input=json.dumps(full), text=True,
                                         capture_output=True, timeout=600, check=False)
@@ -406,10 +434,17 @@ def cmd_run(client, args):
                     detail = result.stderr.strip().splitlines()[-1:] or [""]
                     raise RuntimeError(f"Worker exited with status {result.returncode}. {detail[0]}".strip())
                 reply = result.stdout.strip()
-                if not reply or len(reply.encode()) > 12000:
+                if ambient and not reply:
+                    action = "done"  # the worker had nothing to add to an untagged message
+                elif not reply or len(reply.encode()) > 12000:
                     raise RuntimeError("Worker returned an empty or oversized reply.")
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-                action, reply = "failed", str(error)[:2000]
+                if ambient:
+                    # Nobody asked; close quietly rather than flag the room.
+                    print(f"Worker failed on an ambient request: {error}", file=sys.stderr, flush=True)
+                    action, reply = "done", ""
+                else:
+                    action, reply = "failed", str(error)[:2000]
             client.state["outbox"] = {"assignment_id": item["id"], "action": action,
                                       "text": reply, "request_id": str(uuid.uuid4())}
             client.save()
